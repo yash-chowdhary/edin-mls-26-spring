@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 
 # ============================================================================
@@ -70,7 +71,24 @@ def rmsnorm_kernel(
     # Step 4: Apply weight and store
 
     # YOUR CODE HERE
-    pass
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < hidden_size
+    
+    row_start_ptr = x_ptr + (pid * stride_x)
+    x_pointers = row_start_ptr + col_offsets
+    w_pointers = w_ptr + col_offsets
+    
+    x = tl.load(x_pointers, mask=mask, other=0.0).to(tl.float32)
+    weight = tl.load(w_pointers, mask=mask, other=0.0).to(tl.float32)
+
+    mean_sq = tl.sum(x * x, axis=0) / hidden_size
+
+    inv_rms = tl.rsqrt(mean_sq + eps)
+    rms_norm = x * inv_rms * weight
+
+    output_start_ptr = y_ptr + (pid * stride_y)
+    y_pointers = output_start_ptr + col_offsets
+    tl.store(y_pointers, rms_norm, mask=mask)
 
 
 @triton.jit
@@ -105,7 +123,27 @@ def layernorm_kernel(
     # Step 5: Normalize and apply affine transform
 
     # YOUR CODE HERE
-    pass
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < hidden_size
+    
+    row_start_ptr = x_ptr + (pid * stride_x)
+    x_pointers = row_start_ptr + col_offsets
+    w_pointers = w_ptr + col_offsets
+    b_pointers = b_ptr + col_offsets
+    
+    x = tl.load(x_pointers, mask=mask, other=0.0).to(tl.float32)
+    weight = tl.load(w_pointers, mask=mask, other=0.0).to(tl.float32)
+    bias = tl.load(b_pointers, mask=mask, other=0.0).to(tl.float32)
+
+    mean = tl.sum(x,axis=0) / hidden_size
+    mean_sq = tl.sum((x - mean) * (x-mean), axis=0) / hidden_size
+    inv_rms = tl.rsqrt(mean_sq + eps)
+
+    layer_norm = (x - mean) * inv_rms * weight + bias
+    
+    output_start_ptr = y_ptr + (pid * stride_y)
+    y_pointers = output_start_ptr + col_offsets
+    tl.store(y_pointers, layer_norm, mask=mask)
 
 
 @triton.jit
@@ -126,7 +164,14 @@ def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     # Step 3: Store output
 
     # YOUR CODE HERE
-    pass
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+
+    sqrt_2_over_pi = 0.7978845608028654
+    gelu = 0.5 * x * (1 + libdevice.tanh(sqrt_2_over_pi * (x + 0.044715 * x * x * x)))
+
+    tl.store(y_ptr + offs, gelu, mask=mask)
 
 
 @triton.jit
@@ -147,7 +192,15 @@ def silu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     # Step 3: Multiply and store
 
     # YOUR CODE HERE
-    pass
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+
+    # sigmoid = 1 / (1 + tl.exp(-1*x))
+    swish = x * tl.sigmoid(x)
+
+    tl.store(y_ptr + offs, swish, mask=mask)
+
 
 
 @triton.jit
@@ -188,7 +241,28 @@ def linear_kernel_tf32(
     # Step 3: Store the result
 
     # YOUR CODE HERE
-    pass
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
+    mask_c = (offs_m < M) & (offs_n < N)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        offs_k = k + tl.arange(0, BLOCK_K)
+
+        a_ptrs = a_ptr + (offs_m * stride_am) + (offs_k[None, :] * stride_ak) # (BM, BK)
+        b_ptrs = b_ptr + (offs_k[:, None] * stride_bk) + (offs_n * stride_bn)  # (BK, BN)
+
+        mask_a = (offs_m < M) & (offs_k[None, :] < K)
+        mask_b = (offs_k[:, None] < K) & (offs_n < N)
+
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+
+        acc = tl.dot(a,b, acc)
+    
+    c_ptrs = c_ptr + (offs_m * stride_cm) + (offs_n * stride_cn)
+    tl.store(c_ptrs, acc, mask=mask_c)
 
 
 @triton.jit
@@ -349,7 +423,26 @@ def softmax_kernel(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.cons
     # Step 4: Store output
 
     # YOUR CODE HERE
-    pass
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
+    
+    row_start_ptr = x_ptr + (row * stride_x)
+    pointers = row_start_ptr + col_offsets
+    
+    x = tl.load(pointers, mask=mask, other=-float('inf'))
+
+    max = tl.max(x, axis=0)
+    stable_x = x - max
+
+    exponentiated_x = tl.exp(stable_x)
+    safe_exps = tl.where(mask, exponentiated_x, 0.0)
+    sum_exponentiated_x = tl.sum(safe_exps, axis=0)
+
+    softmax = safe_exps / sum_exponentiated_x
+
+    output_pointers = y_ptr + (row * stride_y) + col_offsets
+    tl.store(output_pointers, softmax, mask=mask)
+    
 
 
 @triton.jit

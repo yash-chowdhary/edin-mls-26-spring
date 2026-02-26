@@ -63,7 +63,23 @@ def attention_scores_kernel(
     # Step 4: Store scores
 
     # YOUR CODE HERE
-    pass
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    mask_q=offs_d < head_dim
+    q_ptrs = q_ptr + pid_bh * stride_q0 + pid_q * stride_q1 + offs_d * stride_q2
+    
+    k_ptrs = k_ptr + pid_bh * stride_k0 + offs_k[:, None] * stride_k1 + offs_d[None, :] * stride_k2
+    mask_k = (offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim)
+
+    queries = tl.load(q_ptrs,mask=mask_q,other=0.0)
+    keys = tl.load(k_ptrs,mask=mask_k,other=0.0)
+    
+    attn_scores = tl.sum(keys * queries[None, :], axis=1) * scale
+
+    output_ptrs = scores_ptr + pid_bh * stride_s0 + pid_q * stride_s1 + offs_k * stride_s2
+    mask_output = offs_k < seq_k
+    tl.store(output_ptrs, attn_scores, mask=mask_output)
 
 
 @triton.jit
@@ -84,7 +100,22 @@ def softmax_inplace_kernel(scores_ptr, stride_s, seq_k, BLOCK_SIZE: tl.constexpr
     # Step 4: Store back
 
     # YOUR CODE HERE
-    pass
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < seq_k
+    
+    row_start_ptr = scores_ptr + (row * stride_s)
+    pointers = row_start_ptr + col_offsets
+    x = tl.load(pointers, mask=mask, other=-float('inf'))
+
+    max = tl.max(x, axis=0)
+    stable_x = x - max
+
+    exponentiated_x = tl.exp(stable_x)
+    safe_exps = tl.where(mask, exponentiated_x, 0.0)
+    sum_exponentiated_x = tl.sum(safe_exps, axis=0)
+
+    softmax = safe_exps / sum_exponentiated_x
+    tl.store(pointers, softmax, mask=mask)
 
 
 @triton.jit
@@ -123,7 +154,21 @@ def attention_output_kernel(
     # Step 4: Store output
 
     # YOUR CODE HERE
-    pass
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    attn_weights_ptrs = attn_ptr + pid_bh * stride_w0 + pid_q * stride_w1 + offs_k * stride_w2
+    mask_weights = offs_k < seq_k
+    weights = tl.load(attn_weights_ptrs, mask=mask_weights, other=0.0)
+
+    value_ptrs = v_ptr + pid_bh * stride_v0 + offs_k[:, None] * stride_v1 + offs_d[None, :] * stride_v2
+    mask_vals = (offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim)
+    values = tl.load(value_ptrs, mask= mask_vals, other=0.0)
+
+    out = tl.sum(values * weights[:, None], axis=0)
+    output_ptrs = output_ptr + pid_bh * stride_o0 + pid_q * stride_o1 + offs_d * stride_o2
+    mask_output = offs_d < head_dim
+    tl.store(output_ptrs, out, mask=mask_output)
 
 
 @triton.jit
