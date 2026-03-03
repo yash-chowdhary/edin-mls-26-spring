@@ -60,36 +60,28 @@ def compute_freqs_kernel(
 
     # YOUR CODE HERE
     pid = tl.program_id(0)
-    if pid >= seq_len:
-        return
+    offs = tl.arange(0, BLOCK)
+    mask = offs < half_dim
 
-    # 1. Load the position scalar for this PID
-    # positions_ptr is usually [seq_len], so we offset by pid * stride
-    pos_offset = pid * stride_pos
-    pos = tl.load(positions_ptr + pos_offset)
+    pos = tl.load(positions_ptr + pid * stride_pos)
+    inv = tl.load(inv_freq_ptr + offs * stride_inv, mask=mask, other=0.0)
+    freqs = pos * inv
 
-    # 2. Load inverse frequencies
-    # These are usually [half_dim]. We create a mask since BLOCK might > half_dim
-    offsets = tl.arange(0, BLOCK)
-    mask = offsets < half_dim
-    
-    inv_freq_offsets = offsets * stride_inv
-    inv_freq = tl.load(inv_freq_ptr + inv_freq_offsets, mask=mask, other=0.0)
+    cos_half = tl.cos(freqs)
+    sin_half = tl.sin(freqs)
 
-    # 3. Compute freqs = position * inv_freq
-    freqs = pos * inv_freq
-
-    # 4. Compute cos and sin
-    # We cast to float32 for the transcendental functions for precision
-    cos_vals = tl.cos(freqs.to(tl.float32))
-    sin_vals = tl.sin(freqs.to(tl.float32))
-
-    # 5. Store results
-    # Output pointers are usually [seq_len, half_dim]
-    out_offsets = pid * stride_cos0 + offsets * stride_cos1
-    
-    tl.store(cos_ptr + out_offsets, cos_vals, mask=mask)
-    tl.store(sin_ptr + out_offsets, sin_vals, mask=mask)
+    tl.store(cos_ptr + pid * stride_cos0 + offs * stride_cos1, cos_half, mask=mask)
+    tl.store(
+        cos_ptr + pid * stride_cos0 + (offs + half_dim) * stride_cos1,
+        cos_half,
+        mask=mask,
+    )
+    tl.store(sin_ptr + pid * stride_sin0 + offs * stride_sin1, sin_half, mask=mask)
+    tl.store(
+        sin_ptr + pid * stride_sin0 + (offs + half_dim) * stride_sin1,
+        sin_half,
+        mask=mask,
+    )
 
 
 # ============================================================================

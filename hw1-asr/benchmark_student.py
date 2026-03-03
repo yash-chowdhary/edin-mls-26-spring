@@ -536,11 +536,24 @@ def main():
     parser.add_argument('--audio', type=str, help='Path to test audio file (wav/flac)')
     parser.add_argument('--warmup', type=int, default=1, help='Number of warmup runs')
     parser.add_argument('--runs', type=int, default=3, help='Number of benchmark runs')
+    parser.add_argument('--offline', action='store_true', help='Use Hugging Face cache only (no download). Run once without this to download weights.')
     args = parser.parse_args()
+
+    # Apply offline mode before any Hugging Face code runs
+    if args.offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        print("Offline mode: using cached weights only (no download).")
+    # Use Triton model cache to skip slow HF weight load after first run
+    os.environ["GLM_ASR_USE_TRITON_CACHE"] = "1"
 
     print("=" * 70)
     print("GLM-ASR Student Version Benchmark")
     print("=" * 70)
+    if not args.offline:
+        print("Tip: After the first run, use --offline to skip Hugging Face downloads.")
+    print("Tip: First run builds a Triton model cache; later runs load from cache (faster).")
+    print()
 
     # Load test audio
     print("\nLoading test audio...")

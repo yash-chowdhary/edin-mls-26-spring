@@ -5,6 +5,7 @@ Educational implementation using Triton for tile-based GPU programming
 Loads pre-trained weights from safetensors format into the model.
 """
 
+import os
 from pathlib import Path
 from typing import Dict, Optional, Union
 
@@ -248,13 +249,18 @@ def load_weights_from_hf_model(model, hf_model) -> None:
 def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
     """
     Load GLM-ASR model from HuggingFace and create Triton version.
+    When HF_HUB_OFFLINE=1 or TRANSFORMERS_OFFLINE=1, uses cache only (no download).
     """
     from transformers import AutoProcessor, GlmAsrForConditionalGeneration, AutoConfig
     from model import GlmAsrModel
 
-    print(f"Loading HuggingFace model: {model_name}")
+    local_files_only = (
+        os.environ.get("HF_HUB_OFFLINE") == "1"
+        or os.environ.get("TRANSFORMERS_OFFLINE") == "1"
+    )
+    print(f"Loading HuggingFace model: {model_name}" + (" (offline)" if local_files_only else ""))
 
-    hf_config = AutoConfig.from_pretrained(model_name)
+    hf_config = AutoConfig.from_pretrained(model_name, local_files_only=local_files_only)
     triton_config = create_config_from_hf(hf_config)
 
     print("Creating Triton model with config:")
@@ -269,10 +275,14 @@ def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
 
     print("Loading HuggingFace weights...")
     hf_model = GlmAsrForConditionalGeneration.from_pretrained(
-        model_name, torch_dtype=torch.float32, device_map="cpu"
+        model_name,
+        torch_dtype=torch.float32,
+        device_map="cpu",
+        local_files_only=local_files_only,
+        low_cpu_mem_usage=True,
     )
 
-    processor = AutoProcessor.from_pretrained(model_name)
+    processor = AutoProcessor.from_pretrained(model_name, local_files_only=local_files_only)
 
     load_weights_from_hf_model(triton_model, hf_model)
 

@@ -373,10 +373,11 @@ def detailed_profile_torch(model, input_features, input_ids, input_features_mask
     audio_token_id = 59260
     audio_mask = (input_ids == audio_token_id)
 
-    combined_embeds = text_embeds.clone()
+    combined_embeds = text_embeds.clone().to(torch.bfloat16)
     if torch.any(audio_mask):
         audio_positions = torch.where(audio_mask[0])[0]
         num_audio_tokens = int(audio_positions.numel())
+        projected = projected.to(torch.bfloat16)
         if num_audio_tokens <= projected.shape[1]:
             combined_embeds[0, audio_positions[:projected.shape[1]]] = projected[0, :num_audio_tokens]
 

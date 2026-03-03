@@ -74,21 +74,19 @@ def rmsnorm_kernel(
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < hidden_size
     
-    row_start_ptr = x_ptr + (pid * stride_x)
-    x_pointers = row_start_ptr + col_offsets
+    x_pointers = x_ptr + (pid * stride_x + col_offsets)
     w_pointers = w_ptr + col_offsets
     
     x = tl.load(x_pointers, mask=mask, other=0.0).to(tl.float32)
     weight = tl.load(w_pointers, mask=mask, other=0.0).to(tl.float32)
 
     mean_sq = tl.sum(x * x, axis=0) / hidden_size
-
     inv_rms = tl.rsqrt(mean_sq + eps)
-    rms_norm = x * inv_rms * weight
+    
+    out = x * inv_rms * weight
 
-    output_start_ptr = y_ptr + (pid * stride_y)
-    y_pointers = output_start_ptr + col_offsets
-    tl.store(y_pointers, rms_norm, mask=mask)
+    y_pointers = y_ptr + (pid * stride_y + col_offsets)
+    tl.store(y_pointers, out.to(tl.bfloat16), mask=mask)
 
 
 @triton.jit
@@ -126,8 +124,7 @@ def layernorm_kernel(
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < hidden_size
     
-    row_start_ptr = x_ptr + (pid * stride_x)
-    x_pointers = row_start_ptr + col_offsets
+    x_pointers = x_ptr + (pid * stride_x) + col_offsets
     w_pointers = w_ptr + col_offsets
     b_pointers = b_ptr + col_offsets
     
@@ -135,15 +132,14 @@ def layernorm_kernel(
     weight = tl.load(w_pointers, mask=mask, other=0.0).to(tl.float32)
     bias = tl.load(b_pointers, mask=mask, other=0.0).to(tl.float32)
 
-    mean = tl.sum(x,axis=0) / hidden_size
-    mean_sq = tl.sum((x - mean) * (x-mean), axis=0) / hidden_size
-    inv_rms = tl.rsqrt(mean_sq + eps)
+    x_centered = tl.where(mask, x - mean, 0.0)
+    var = tl.sum(x_centered * x_centered, axis=0) / hidden_size
+    inv_std = tl.rsqrt(var + eps)
 
-    layer_norm = (x - mean) * inv_rms * weight + bias
+    layer_norm = x_centered * inv_std * weight + bias
     
-    output_start_ptr = y_ptr + (pid * stride_y)
-    y_pointers = output_start_ptr + col_offsets
-    tl.store(y_pointers, layer_norm, mask=mask)
+    y_pointers = y_ptr + (pid * stride_y + col_offsets)
+    tl.store(y_pointers, layer_norm.to(tl.bfloat16), mask=mask)
 
 
 @triton.jit
@@ -222,47 +218,44 @@ def linear_kernel_tf32(
     BLOCK_K: tl.constexpr,
 ):
     """
-    TF32-style matmul: output = A @ B.
-    A: (M, K), B: (K, N), C: (M, N)
-
-    *** TODO: Implement this kernel ***
-
-    Grid: (M // BLOCK_M, N // BLOCK_N)
+    Optimized Matmul for H200:
+    - Inputs: bfloat16 (via pointer dereference)
+    - Accumulation: float32 (for numerical stability)
+    - Storage: bfloat16 (to match your Linear class output)
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    # ============================================================================
-    # TODO: Implement tiled matrix multiplication
-    # ============================================================================
-    #
-    # Step 1: Initialize accumulator
-    # Step 2: Loop over K tiles and accumulate tl.dot
-    # Step 3: Store the result
+    # 1. Create offsets for the blocks
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None]
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N))[None, :]
+    offs_k = tl.arange(0, BLOCK_K)
 
-    # YOUR CODE HERE
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
-    mask_c = (offs_m < M) & (offs_n < N)
-
+    # 2. Initialize accumulator in float32
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
+    # 3. Loop over K tiles
     for k in range(0, K, BLOCK_K):
-        offs_k = k + tl.arange(0, BLOCK_K)
-
-        a_ptrs = a_ptr + (offs_m * stride_am) + (offs_k[None, :] * stride_ak) # (BM, BK)
-        b_ptrs = b_ptr + (offs_k[:, None] * stride_bk) + (offs_n * stride_bn)  # (BK, BN)
-
-        mask_a = (offs_m < M) & (offs_k[None, :] < K)
-        mask_b = (offs_k[:, None] < K) & (offs_n < N)
-
-        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
-        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
-
-        acc = tl.dot(a,b, acc)
+        # Load A and B tiles (Triton handles the bfloat16 -> float32 cast if needed, 
+        # but Tensor Cores prefer staying in 16-bit until the dot product)
+        a = tl.load(
+            a_ptr + (offs_m * stride_am + (k + offs_k[None, :]) * stride_ak),
+            mask=(offs_m < M) & (k + offs_k[None, :] < K),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptr + ((k + offs_k[:, None]) * stride_bk + offs_n * stride_bn),
+            mask=((k + offs_k[:, None]) < K) & (offs_n < N),
+            other=0.0,
+        )
+        
+        # 4. Use the explicit dot-accumulate instruction
+        # This is the high-performance path for Hopper Tensor Cores
+        acc = tl.dot(a, b, acc, out_dtype=tl.float32)
     
-    c_ptrs = c_ptr + (offs_m * stride_cm) + (offs_n * stride_cn)
-    tl.store(c_ptrs, acc, mask=mask_c)
+    # 5. Cast back to bfloat16 for the final store to match your Linear class
+    c_pointers = c_ptr + (offs_m * stride_cm + offs_n * stride_cn)
+    tl.store(c_pointers, acc.to(tl.bfloat16), mask=(offs_m < M) & (offs_n < N))
 
 
 @triton.jit
@@ -303,81 +296,96 @@ def linear_gelu_kernel(
             mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N),
             other=0.0,
         )
-        acc += tl.dot(a, b)
+        acc = tl.dot(a, b, acc, out_dtype=tl.float32)
 
     sqrt_2_over_pi = 0.7978845608028654
     acc3 = acc * acc * acc
     inner = sqrt_2_over_pi * (acc + 0.044715 * acc3)
     acc = acc * 0.5 * (1.0 + tl.libdevice.tanh(inner))
 
-    tl.store(
-        c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
-        acc,
-        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
-    )
+    c_ptrs = c_ptr + (offs_m * stride_cm + offs_n * stride_cn)
+    tl.store(c_ptrs, acc.to(tl.bfloat16), mask=(offs_m < M) & (offs_n < N))
 
 
 @triton.jit
 def swiglu_fused_kernel(
-    a_ptr,
-    gate_ptr,
-    up_ptr,
-    c_ptr,
-    M,
-    N,
-    K,
-    stride_am,
-    stride_ak,
-    stride_gk,
-    stride_gn,
-    stride_uk,
-    stride_un,
-    stride_cm,
-    stride_cn,
+    a_ptr, gate_ptr, up_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_gk, stride_gn,
+    stride_uk, stride_un,
+    stride_cm, stride_cn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
-    """Fused SwiGLU: SiLU(x @ gate) * (x @ up)."""
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    """
+    Fused SwiGLU: SiLU(x @ gate_w) * (x @ up_w)
+    Optimized for H200 with Mixed Precision and Explicit Dot.
+    """
+    # -----------------------------------------------------------
+    # Swizzling Logic: Map 1D Program ID to a 2D Grouped Grid
+    # -----------------------------------------------------------
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    
+    # Calculate how many PIDs fit into one vertical "stripe" or "group"
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    
+    # Derived 2D coordinates
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    # -----------------------------------------------------------
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    # Offsets
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M))[:, None]
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N))[None, :]
     offs_k = tl.arange(0, BLOCK_K)
 
+    # Initialize two accumulators in float32 for high precision
     gate_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     up_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for k in range(0, K, BLOCK_K):
+        # Load Input Tile (Shared by both matmuls)
         a = tl.load(
-            a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak,
-            mask=(offs_m[:, None] < M) & (k + offs_k[None, :] < K),
+            a_ptr + offs_m * stride_am + (k + offs_k[None, :]) * stride_ak,
+            mask=(offs_m < M) & (k + offs_k[None, :] < K),
             other=0.0,
         )
+        # Load Gate Weight Tile
         gate_w = tl.load(
-            gate_ptr + (k + offs_k[:, None]) * stride_gk + offs_n[None, :] * stride_gn,
-            mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N),
+            gate_ptr + (k + offs_k[:, None]) * stride_gk + offs_n * stride_gn,
+            mask=((k + offs_k[:, None]) < K) & (offs_n < N),
             other=0.0,
         )
+        # Load Up Weight Tile
         up_w = tl.load(
-            up_ptr + (k + offs_k[:, None]) * stride_uk + offs_n[None, :] * stride_un,
-            mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N),
+            up_ptr + (k + offs_k[:, None]) * stride_uk + offs_n * stride_un,
+            mask=((k + offs_k[:, None]) < K) & (offs_n < N),
             other=0.0,
         )
 
-        gate_acc += tl.dot(a, gate_w)
-        up_acc += tl.dot(a, up_w)
+        # Explicit dot-product with accumulation in float32
+        # This maps to the WGMMA/HMMA instructions on H200
+        gate_acc = tl.dot(a, gate_w, gate_acc, out_dtype=tl.float32)
+        up_acc = tl.dot(a, up_w, up_acc, out_dtype=tl.float32)
 
-    sigmoid = 1.0 / (1.0 + tl.exp(-gate_acc))
-    gate_act = gate_acc * sigmoid
+    # --- Fused Activation and Gating ---
+    # Apply SiLU to gate_acc: x * sigmoid(x)
+    # Then multiply by up_acc
+    # All arithmetic happens in FP32 registers
+    gate_act = gate_acc * tl.sigmoid(gate_acc)
     out = gate_act * up_acc
 
-    tl.store(
-        c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
-        out,
-        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
-    )
+    # Store back to global memory as BFloat16
+    c_pointers = c_ptr + (offs_m * stride_cm + offs_n * stride_cn)
+    tl.store(c_pointers, out.to(tl.bfloat16), mask=(offs_m < M) & (offs_n < N))
 
 
 @triton.jit
@@ -424,24 +432,21 @@ def softmax_kernel(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.cons
 
     # YOUR CODE HERE
     col_offsets = tl.arange(0, BLOCK_SIZE)
+    x_pointers = x_ptr + row * stride_x + col_offsets
+    y_pointers = y_ptr + row * stride_y + col_offsets
     mask = col_offsets < n_cols
     
-    row_start_ptr = x_ptr + (row * stride_x)
-    pointers = row_start_ptr + col_offsets
-    
-    x = tl.load(pointers, mask=mask, other=-float('inf'))
+    x = tl.load(x_pointers, mask=mask, other=-float('inf')).to(tl.float32)
 
     max = tl.max(x, axis=0)
     stable_x = x - max
 
     exponentiated_x = tl.exp(stable_x)
-    safe_exps = tl.where(mask, exponentiated_x, 0.0)
-    sum_exponentiated_x = tl.sum(safe_exps, axis=0)
+    sum_exponentiated_x = tl.sum(tl.where(mask, exponentiated_x, 0.0), axis=0)
 
-    softmax = safe_exps / sum_exponentiated_x
+    softmax = exponentiated_x / sum_exponentiated_x
 
-    output_pointers = y_ptr + (row * stride_y) + col_offsets
-    tl.store(output_pointers, softmax, mask=mask)
+    tl.store(y_pointers, softmax.to(tl.bfloat16), mask=mask)
     
 
 
@@ -600,7 +605,7 @@ class RMSNorm:
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         self.hidden_size = hidden_size
         self.eps = eps
-        self.weight = torch.ones(hidden_size, dtype=torch.float32)
+        self.weight = torch.ones(hidden_size, dtype=torch.bfloat16)
         self.use_triton = _is_power_of_two(hidden_size)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
@@ -609,7 +614,7 @@ class RMSNorm:
         if self.use_triton and x.is_cuda:
             batch_size = int(np.prod(x.shape[:-1]))
             x_flat = x.reshape(batch_size, self.hidden_size).contiguous()
-            x_flat = x_flat.to(torch.float32)
+            x_flat = x_flat.to(torch.bfloat16)
             output = torch.empty_like(x_flat)
 
             if self.weight.device != x.device:
@@ -628,12 +633,12 @@ class RMSNorm:
             )
             return output.reshape(original_shape)
 
-        x_float = x.to(torch.float32)
-        variance = torch.mean(x_float * x_float, dim=-1, keepdim=True)
-        x_normed = x_float * torch.rsqrt(variance + self.eps)
+        x_float = x.to(torch.bfloat16)
+        variance = torch.mean(x_float * x_float, dim=-1, keepdim=True).to(torch.bfloat16)
+        x_normed = x_float * torch.rsqrt(variance + self.eps).to(torch.bfloat16)
         if self.weight.device != x.device:
             self.weight = self.weight.to(x.device)
-        return (self.weight * x_normed).to(x.dtype)
+        return (self.weight * x_normed).to(torch.bfloat16)
 
 
 class LayerNorm:
@@ -642,8 +647,8 @@ class LayerNorm:
     def __init__(self, hidden_size: int, eps: float = 1e-5):
         self.hidden_size = hidden_size
         self.eps = eps
-        self.weight = torch.ones(hidden_size, dtype=torch.float32)
-        self.bias = torch.zeros(hidden_size, dtype=torch.float32)
+        self.weight = torch.ones(hidden_size, dtype=torch.bfloat16)
+        self.bias = torch.zeros(hidden_size, dtype=torch.bfloat16)
         self.use_triton = _is_power_of_two(hidden_size)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
@@ -652,7 +657,7 @@ class LayerNorm:
         if self.use_triton and x.is_cuda:
             batch_size = int(np.prod(x.shape[:-1]))
             x_flat = x.reshape(batch_size, self.hidden_size).contiguous()
-            x_flat = x_flat.to(torch.float32)
+            x_flat = x_flat.to(torch.bfloat16)
             output = torch.empty_like(x_flat)
 
             if self.weight.device != x.device:
@@ -674,22 +679,22 @@ class LayerNorm:
             )
             return output.reshape(original_shape)
 
-        x_float = x.to(torch.float32)
+        x_float = x.to(torch.bfloat16)
         mean = torch.mean(x_float, dim=-1, keepdim=True)
-        variance = torch.var(x_float, dim=-1, keepdim=True, unbiased=False)
-        x_normed = (x_float - mean) * torch.rsqrt(variance + self.eps)
+        variance = torch.var(x_float, dim=-1, keepdim=True, unbiased=False).to(torch.bfloat16)
+        x_normed = (x_float - mean) * torch.rsqrt(variance + self.eps).to(torch.bfloat16)
         if self.weight.device != x.device:
             self.weight = self.weight.to(x.device)
         if self.bias.device != x.device:
             self.bias = self.bias.to(x.device)
-        return (self.weight * x_normed + self.bias).to(x.dtype)
+        return (self.weight * x_normed + self.bias).to(torch.bfloat16)
 
 
 def gelu(x: torch.Tensor) -> torch.Tensor:
     """GELU activation using Triton."""
     original_shape = x.shape
     total = int(np.prod(x.shape))
-    block = 256
+    block = 1024
 
     x_flat = x.reshape(-1).contiguous().to(torch.float32)
     output = torch.empty_like(x_flat)
@@ -706,7 +711,7 @@ def silu(x: torch.Tensor) -> torch.Tensor:
     """SiLU activation using Triton."""
     original_shape = x.shape
     total = int(np.prod(x.shape))
-    block = 256
+    block = 1024
 
     x_flat = x.reshape(-1).contiguous().to(torch.float32)
     output = torch.empty_like(x_flat)
@@ -730,8 +735,8 @@ def get_activation(name: str):
 class Linear:
     """Linear layer with switchable backend (torch or Triton)."""
 
-    TILE_M = 64
-    TILE_N = 64
+    TILE_M = 128
+    TILE_N = 128
     TILE_K = 32
 
     BACKEND = "torch"
@@ -741,8 +746,8 @@ class Linear:
         self.out_features = out_features
         self.has_bias = bias
 
-        self.weight = torch.zeros((out_features, in_features), dtype=torch.float32)
-        self.bias_param = torch.zeros(out_features, dtype=torch.float32) if bias else None
+        self.weight = torch.zeros((out_features, in_features), dtype=torch.bfloat16)
+        self.bias_param = torch.zeros(out_features, dtype=torch.bfloat16) if bias else None
 
         self._weight_t_padded = None
         self._K_padded = None
@@ -756,11 +761,11 @@ class Linear:
             self._K_padded = pad_to_multiple(K, self.TILE_K)
             self._N_padded = pad_to_multiple(N, self.TILE_N)
 
-            weight_t = self.weight.t().contiguous()
+            weight_t = self.weight.t().to(torch.bfloat16).contiguous()
             if self._K_padded > K or self._N_padded > N:
                 weight_pad = torch.zeros(
                     (self._K_padded, self._N_padded),
-                    dtype=torch.float32,
+                    dtype=torch.bfloat16,
                     device=weight_t.device,
                 )
                 weight_pad[:K, :N] = weight_t
@@ -784,16 +789,16 @@ class Linear:
         batch_dims = original_shape[:-1]
 
         M = int(np.prod(batch_dims))
-        x_2d = x.reshape(M, self.in_features).to(torch.float32)
+        x_2d = x.reshape(M, self.in_features).to(torch.bfloat16)
 
         if self.weight.device != x.device:
             self.weight = self.weight.to(x.device)
-        output = x_2d @ self.weight.t()
+        output = x_2d @ self.weight.t().to(torch.bfloat16)
 
         if self.has_bias and self.bias_param is not None:
             if self.bias_param.device != x.device:
                 self.bias_param = self.bias_param.to(x.device)
-            output = output + self.bias_param
+            output = output + self.bias_param.to(torch.bfloat16)
 
         return output.reshape(*batch_dims, self.out_features)
 
@@ -806,7 +811,7 @@ class Linear:
         K = self.in_features
         N = self.out_features
 
-        x_2d = x.reshape(M, K).to(torch.float32).contiguous()
+        x_2d = x.reshape(M, K).to(torch.bfloat16).contiguous()
 
         if self.weight.device != x.device:
             self.weight = self.weight.to(x.device)
@@ -818,7 +823,7 @@ class Linear:
         if M_padded > M or self._K_padded > K:
             x_padded = torch.zeros(
                 (M_padded, self._K_padded),
-                dtype=torch.float32,
+                dtype=torch.bfloat16,
                 device=x.device,
             )
             x_padded[:M, :K] = x_2d
@@ -826,7 +831,7 @@ class Linear:
             x_padded = x_2d
 
         output = torch.zeros(
-            (M_padded, self._N_padded), dtype=torch.float32, device=x.device
+            (M_padded, self._N_padded), dtype=torch.bfloat16, device=x.device
         )
 
         grid = (
@@ -849,6 +854,8 @@ class Linear:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            num_warps=16,
+            num_stages=7,
         )
 
         output = output[:M, :N]
@@ -867,7 +874,7 @@ class Embedding:
     def __init__(self, num_embeddings: int, embedding_dim: int):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        self.weight = torch.zeros((num_embeddings, embedding_dim), dtype=torch.float32)
+        self.weight = torch.zeros((num_embeddings, embedding_dim), dtype=torch.bfloat16)
 
     def __call__(self, input_ids: torch.Tensor) -> torch.Tensor:
         original_shape = input_ids.shape
@@ -878,15 +885,15 @@ class Embedding:
 
         if not input_ids.is_cuda:
             flat = input_ids.reshape(-1).to(torch.int64)
-            output = self.weight.index_select(0, flat)
+            output = self.weight.index_select(0, flat).to(torch.bfloat16)
             return output.reshape(*original_shape, self.embedding_dim)
 
         indices_flat = input_ids.reshape(-1).to(torch.int32).contiguous()
         output = torch.empty(
-            (batch_size, self.embedding_dim), dtype=torch.float32, device=indices_flat.device
+            (batch_size, self.embedding_dim), dtype=torch.bfloat16, device=indices_flat.device
         )
 
-        block = 256
+        block = 512
         grid = (batch_size, triton.cdiv(self.embedding_dim, block))
         embedding_kernel[grid](
             indices_flat,
@@ -911,11 +918,12 @@ def softmax(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
     batch_size = int(np.prod(x.shape[:-1]))
     seq_len = x.shape[-1]
 
-    x_flat = x.reshape(batch_size, seq_len).to(torch.float32).contiguous()
+    x_flat = x.reshape(batch_size, seq_len).to(torch.bfloat16).contiguous()
     output = torch.empty_like(x_flat)
 
     if x.is_cuda:
         block = next_power_of_two(seq_len)
+        num_warps = 8 if block <= 4096 else 16
         softmax_kernel[(batch_size,)](
             x_flat,
             output,
@@ -923,10 +931,11 @@ def softmax(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
             output.stride(0),
             seq_len,
             BLOCK_SIZE=block,
+            num_warps=num_warps,
         )
         result = output.reshape(original_shape)
     else:
-        result = torch.softmax(x, dim=-1)
+        result = torch.softmax(x.to(torch.float32), dim=-1).to(torch.bfloat16)
 
     if axis != -1 and axis != len(original_shape) - 1:
         result = torch.movedim(result, -1, axis)
@@ -938,7 +947,7 @@ class MLP:
     """MLP with SwiGLU gating using Triton."""
 
     FUSED = True
-    TILE_M, TILE_N, TILE_K = 64, 64, 32
+    TILE_M, TILE_N, TILE_K = 128, 128, 32
 
     def __init__(
         self,
@@ -970,8 +979,8 @@ class MLP:
         if self._gate_weight_t is None and self.use_gating:
             if self.gate_proj.weight.device != self.up_proj.weight.device:
                 self.up_proj.weight = self.up_proj.weight.to(self.gate_proj.weight.device)
-            self._gate_weight_t = self.gate_proj.weight.t().contiguous()
-            self._up_weight_t = self.up_proj.weight.t().contiguous()
+            self._gate_weight_t = self.gate_proj.weight.t().to(torch.bfloat16).contiguous()
+            self._up_weight_t = self.up_proj.weight.t().to(torch.bfloat16).contiguous()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_gating and MLP.FUSED and x.is_cuda:
@@ -995,7 +1004,7 @@ class MLP:
         self._prepare_fused_weights()
 
         orig_shape = x.shape
-        x_2d = x.reshape(-1, self.hidden_size).to(torch.float32).contiguous()
+        x_2d = x.reshape(-1, self.hidden_size).to(torch.bfloat16).contiguous()
         M = x_2d.shape[0]
         K = self.hidden_size
         N = self.intermediate_size
@@ -1005,20 +1014,19 @@ class MLP:
         N_pad = pad_to_multiple(N, self.TILE_N)
 
         if M != M_pad or K != K_pad:
-            x_padded = torch.zeros(
-                (M_pad, K_pad), dtype=torch.float32, device=x.device
-            )
+            x_padded = torch.empty((M_pad, K_pad), dtype=torch.bfloat16, device=x.device)
+            x_padded.zero_() # Only if masking in the kernel isn't perfect
             x_padded[:M, :K] = x_2d
         else:
             x_padded = x_2d
 
         if K != K_pad or N != N_pad:
             gate_w_padded = torch.zeros(
-                (K_pad, N_pad), dtype=torch.float32, device=x.device
+                (K_pad, N_pad), dtype=torch.bfloat16, device=x.device
             )
             gate_w_padded[:K, :N] = self._gate_weight_t
             up_w_padded = torch.zeros(
-                (K_pad, N_pad), dtype=torch.float32, device=x.device
+                (K_pad, N_pad), dtype=torch.bfloat16, device=x.device
             )
             up_w_padded[:K, :N] = self._up_weight_t
         else:
@@ -1026,13 +1034,16 @@ class MLP:
             up_w_padded = self._up_weight_t
 
         intermediate = torch.zeros(
-            (M_pad, N_pad), dtype=torch.float32, device=x.device
+            (M_pad, N_pad), dtype=torch.bfloat16, device=x.device
         )
 
-        grid = (
-            triton.cdiv(M_pad, self.TILE_M),
-            triton.cdiv(N_pad, self.TILE_N),
-        )
+        # Calculate total number of blocks
+        num_blocks_m = triton.cdiv(M_pad, self.TILE_M)
+        num_blocks_n = triton.cdiv(N_pad, self.TILE_N)
+        
+        # Grid is now 1D
+        grid = (num_blocks_m * num_blocks_n,)
+
         swiglu_fused_kernel[grid](
             x_padded,
             gate_w_padded,
@@ -1052,6 +1063,9 @@ class MLP:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            GROUP_SIZE_M=8,
+            num_warps=16,
+            num_stages=7,
         )
 
         if M != M_pad or N != N_pad:
@@ -1065,7 +1079,7 @@ class EncoderMLP:
     """Encoder MLP (no gating) using Triton."""
 
     FUSED = True
-    TILE_M, TILE_N, TILE_K = 64, 64, 32
+    TILE_M, TILE_N, TILE_K = 128, 128, 32
 
     def __init__(
         self,
@@ -1087,7 +1101,7 @@ class EncoderMLP:
     def _prepare_fused_weights(self):
         """Prepare pre-transposed weights for fused kernel."""
         if self._fc1_weight_t is None:
-            self._fc1_weight_t = self.fc1.weight.t().contiguous()
+            self._fc1_weight_t = self.fc1.weight.t().to(torch.bfloat16).contiguous()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if EncoderMLP.FUSED and self.activation == "gelu" and x.is_cuda:
@@ -1106,7 +1120,7 @@ class EncoderMLP:
         self._prepare_fused_weights()
 
         orig_shape = x.shape
-        x_2d = x.reshape(-1, self.hidden_size).to(torch.float32).contiguous()
+        x_2d = x.reshape(-1, self.hidden_size).to(torch.bfloat16).contiguous()
         M = x_2d.shape[0]
         K = self.hidden_size
         N = self.intermediate_size
@@ -1116,24 +1130,19 @@ class EncoderMLP:
         N_pad = pad_to_multiple(N, self.TILE_N)
 
         if M != M_pad or K != K_pad:
-            x_padded = torch.zeros(
-                (M_pad, K_pad), dtype=torch.float32, device=x.device
-            )
+            x_padded = torch.empty((M_pad, K_pad), dtype=torch.bfloat16, device=x.device)
             x_padded[:M, :K] = x_2d
         else:
             x_padded = x_2d
 
         if K != K_pad or N != N_pad:
-            fc1_w_padded = torch.zeros(
-                (K_pad, N_pad), dtype=torch.float32, device=x.device
-            )
+            fc1_w_padded = torch.zeros((K_pad, N_pad), dtype=torch.bfloat16, device=x.device)
             fc1_w_padded[:K, :N] = self._fc1_weight_t
         else:
             fc1_w_padded = self._fc1_weight_t
 
-        intermediate = torch.zeros(
-            (M_pad, N_pad), dtype=torch.float32, device=x.device
-        )
+        intermediate = torch.empty((M_pad, N_pad), dtype=torch.bfloat16, device=x.device)
+        intermediate.zero_() # Only if masking in the kernel isn't perfect
 
         grid = (
             triton.cdiv(M_pad, self.TILE_M),
@@ -1155,6 +1164,8 @@ class EncoderMLP:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            num_warps=16,
+            num_stages=7,
         )
 
         if M != M_pad or N != N_pad:
