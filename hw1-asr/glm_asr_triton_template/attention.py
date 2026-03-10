@@ -24,6 +24,159 @@ def get_stream():
 # Triton Kernels for Attention
 # ============================================================================
 
+# gemini's flash attention kernel
+# @triton.jit
+# def flash_attn_forward_kernel(
+#     Q, K, V, Out,
+#     stride_qb, stride_qh, stride_qm, stride_qk,
+#     stride_kb, stride_kh, stride_kn, stride_kk,
+#     stride_vb, stride_vh, stride_vn, stride_vk,
+#     stride_ob, stride_oh, stride_om, stride_ok,
+#     sm_scale,
+#     batch_size, num_heads,
+#     seq_len_q, seq_len_kv,
+#     head_dim,
+#     BLOCK_M: tl.constexpr, 
+#     BLOCK_N: tl.constexpr, 
+#     BLOCK_D: tl.constexpr,
+#     IS_CAUSAL: tl.constexpr,
+# ):
+#     pid_m = tl.program_id(0)
+#     pid_bh = tl.program_id(1)
+
+#     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+#     offs_n = tl.arange(0, BLOCK_N)
+#     offs_d = tl.arange(0, BLOCK_D)
+
+#     q_ptrs = Q + (pid_bh * stride_qh) + (offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk)
+#     q = tl.load(q_ptrs, mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim), other=0.0)
+
+#     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
+#     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+#     acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+
+#     for n_start in range(0, seq_len_kv, BLOCK_N):
+#         offs_n_inner = n_start + offs_n
+        
+#         k_ptrs = K + (pid_bh * stride_kh) + (offs_n_inner[None, :] * stride_kn + offs_d[:, None] * stride_kk)
+#         v_ptrs = V + (pid_bh * stride_vh) + (offs_n_inner[:, None] * stride_vn + offs_d[None, :] * stride_vk)
+
+#         k = tl.load(k_ptrs, mask=(offs_n_inner[None, :] < seq_len_kv) & (offs_d[:, None] < head_dim), other=0.0)
+#         v = tl.load(v_ptrs, mask=(offs_n_inner[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim), other=0.0)
+
+#         qk = tl.dot(q, k) * sm_scale
+        
+#         # --- CAUSAL MASKING LOGIC ---
+#         if IS_CAUSAL:
+#             # Mask if Key index (n) > Query index (m)
+#             qk = tl.where(offs_m[:, None] >= offs_n_inner[None, :], qk, -float('inf'))
+        
+#         qk = tl.where((offs_m[:, None] < seq_len_q) & (offs_n_inner[None, :] < seq_len_kv), qk, -float('inf'))
+
+#         m_ij = tl.max(qk, axis=1)
+#         m_next = tl.maximum(m_i, m_ij)
+#         alpha = tl.exp(m_i - m_next)
+#         p = tl.exp(qk - m_next[:, None])
+        
+#         l_i = l_i * alpha + tl.sum(p, axis=1)
+#         acc = acc * alpha[:, None]
+#         acc = tl.dot(p.to(tl.bfloat16), v.to(tl.bfloat16), acc)
+#         m_i = m_next
+
+#     acc = acc / l_i[:, None]
+#     out_ptrs = Out + (pid_bh * stride_oh) + (offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok)
+#     tl.store(out_ptrs, acc.to(tl.bfloat16), mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim))
+
+# chat-gpt's flash attention kernel
+@triton.jit
+def flash_attn_forward_kernel(
+    Q, K, V, Out,
+    stride_qb, stride_qh, stride_qm, stride_qk,
+    stride_kb, stride_kh, stride_kn, stride_kk,
+    stride_vb, stride_vh, stride_vn, stride_vk,
+    stride_ob, stride_oh, stride_om, stride_ok,
+    sm_scale,
+    batch_size, num_heads,
+    seq_len_q, seq_len_kv,
+    head_dim,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_bh = tl.program_id(1)
+
+    pid_b = pid_bh // num_heads
+    pid_h = pid_bh % num_heads
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    q_base = Q + pid_b * stride_qb + pid_h * stride_qh
+    k_base = K + pid_b * stride_kb + pid_h * stride_kh
+    v_base = V + pid_b * stride_vb + pid_h * stride_vh
+    o_base = Out + pid_b * stride_ob + pid_h * stride_oh
+
+    q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
+    q = tl.load(
+        q_ptrs,
+        mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim),
+        other=0.0,
+    )
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+
+    for n_start in range(0, seq_len_kv, BLOCK_N):
+        offs_n_inner = n_start + offs_n
+
+        k_ptrs = k_base + offs_n_inner[None, :] * stride_kn + offs_d[:, None] * stride_kk
+        v_ptrs = v_base + offs_n_inner[:, None] * stride_vn + offs_d[None, :] * stride_vk
+
+        k = tl.load(
+            k_ptrs,
+            mask=(offs_n_inner[None, :] < seq_len_kv) & (offs_d[:, None] < head_dim),
+            other=0.0,
+        )
+        v = tl.load(
+            v_ptrs,
+            mask=(offs_n_inner[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim),
+            other=0.0,
+        )
+
+        qk = tl.dot(q, k) * sm_scale
+
+        if IS_CAUSAL:
+            qk = tl.where(offs_m[:, None] >= offs_n_inner[None, :], qk, -float("inf"))
+
+        qk = tl.where(
+            (offs_m[:, None] < seq_len_q) & (offs_n_inner[None, :] < seq_len_kv),
+            qk,
+            -float("inf"),
+        )
+
+        m_ij = tl.max(qk, axis=1)
+        m_next = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_next)
+        p = tl.exp(qk - m_next[:, None])
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(tl.bfloat16), v.to(tl.bfloat16), acc)
+        m_i = m_next
+
+    acc = acc / l_i[:, None]
+
+    out_ptrs = o_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+    tl.store(
+        out_ptrs,
+        acc.to(tl.bfloat16),
+        mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim),
+    )
+
 @triton.jit
 def attention_scores_kernel(
     q_ptr,
@@ -239,6 +392,8 @@ def causal_mask_kernel(
 class MultiHeadAttention:
     """Multi-head attention using Triton kernels."""
 
+    USE_FLASH = True
+
     def __init__(
         self,
         hidden_size: int,
@@ -253,6 +408,7 @@ class MultiHeadAttention:
         self.scale = 1.0 / np.sqrt(self.head_dim)
 
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+        # print(f"Using Flash Attention: {self.USE_FLASH}")
 
     def __call__(
         self,
@@ -282,9 +438,54 @@ class MultiHeadAttention:
             k = self._expand_kv(k, self.num_queries_per_kv)
             v = self._expand_kv(v, self.num_queries_per_kv)
 
+        # -----------------------------------------------------------
+        # FLASH ATTENTION PATH 
+        # -----------------------------------------------------------
+        if self.USE_FLASH and q.is_cuda:
+            return self._forward_flash(q, k, v, sm_scale=self.scale, is_causal=is_causal)
+
+        # -----------------------------------------------------------
+        # REGULAR ATTENTION PATH 
+        # -----------------------------------------------------------
         return scaled_dot_product_attention(
             q, k, v, attention_mask, is_causal, self.scale
         )
+
+    def _forward_flash(self, q, k, v, sm_scale, is_causal):
+        """Triton implementation of Flash Attention tiling."""
+        return _flash_attention_forward(q, k, v, sm_scale, is_causal)
+        # batch, num_heads, seq_q, head_dim = q.shape
+        # _, _, seq_kv, _ = k.shape
+
+        # # Output buffer in BFloat16
+        # out = torch.empty_like(q, dtype=torch.bfloat16)
+        
+        # # Logsumexp for numerical stability (optional for inference but good practice)
+        # L = torch.empty((batch * num_heads, seq_q), device=q.device, dtype=torch.float32)
+
+        # # Tuning for H200: BLOCK_M/N of 64 or 128 is usually best
+        # BLOCK_M = 128 if seq_q >= 128 else 64
+        # BLOCK_N = 64
+        
+        # # Grid: (Number of Q blocks, Batch * Heads)
+        # grid = (triton.cdiv(seq_q, BLOCK_M), batch * num_heads)
+
+        # flash_attn_forward_kernel[grid](
+        #     q, k, v, out,
+        #     q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        #     k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        #     v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        #     out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        #     sm_scale,
+        #     batch, num_heads, seq_q, seq_kv, head_dim,
+        #     BLOCK_M=BLOCK_M,
+        #     BLOCK_N=BLOCK_N,
+        #     BLOCK_D=next_power_of_two(head_dim),
+        #     IS_CAUSAL=is_causal,
+        #     num_warps=8,
+        #     num_stages=2,
+        # )
+        # return out
 
     def _expand_kv(self, x: torch.Tensor, num_repeats: int) -> torch.Tensor:
         """Expand KV heads for GQA using broadcast (zero-copy)."""
@@ -301,6 +502,41 @@ def next_power_of_two(x: int) -> int:
 
 
 MAX_ATTENTION_DIM = 256
+
+def _flash_attention_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    is_causal: bool,
+) -> torch.Tensor:
+    batch, num_heads, seq_q, head_dim = q.shape
+    _, _, seq_kv, _ = k.shape
+
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+
+    BLOCK_M = 128 if seq_q >= 128 else 64
+    BLOCK_N = 64
+    BLOCK_D = next_power_of_two(head_dim)
+
+    grid = (triton.cdiv(seq_q, BLOCK_M), batch * num_heads)
+
+    flash_attn_forward_kernel[grid](
+        q, k, v, out,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        scale,
+        batch, num_heads, seq_q, seq_kv, head_dim,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_D=BLOCK_D,
+        IS_CAUSAL=is_causal,
+        num_warps=8,
+        num_stages=2,
+    )
+    return out.to(q.dtype)
 
 
 def scaled_dot_product_attention(
@@ -319,6 +555,22 @@ def scaled_dot_product_attention(
 
     if scale is None:
         scale = 1.0 / np.sqrt(head_dim)
+
+    can_use_flash = (
+        q.is_cuda
+        and attention_mask is None
+        and q.shape == k.shape == v.shape
+        and head_dim <= 256
+    )
+
+    if can_use_flash:
+        return _flash_attention_forward(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            scale,
+            is_causal,
+        )
 
     seq_k_padded = next_power_of_two(seq_k)
     head_dim_padded = next_power_of_two(head_dim)

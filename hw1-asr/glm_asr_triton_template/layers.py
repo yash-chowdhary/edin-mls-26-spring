@@ -131,6 +131,7 @@ def layernorm_kernel(
     x = tl.load(x_pointers, mask=mask, other=0.0).to(tl.float32)
     weight = tl.load(w_pointers, mask=mask, other=0.0).to(tl.float32)
     bias = tl.load(b_pointers, mask=mask, other=0.0).to(tl.float32)
+    mean = tl.sum(x, axis=0) / hidden_size
 
     x_centered = tl.where(mask, x - mean, 0.0)
     var = tl.sum(x_centered * x_centered, axis=0) / hidden_size
@@ -949,6 +950,14 @@ class MLP:
     FUSED = True
     TILE_M, TILE_N, TILE_K = 128, 128, 32
 
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        # FORCE FUSED for CUDA to avoid the standard path overhead
+        if self.use_gating and MLP.FUSED and x.is_cuda:
+            # For the Audio Encoder (M ~ 3000), these tiles are okay, 
+            # but we need to ensure num_stages and num_warps are high.
+            return self._forward_fused(x)
+        return self._forward_standard(x)
+
     def __init__(
         self,
         hidden_size: int,
@@ -1064,8 +1073,8 @@ class MLP:
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
             GROUP_SIZE_M=8,
-            num_warps=16,
-            num_stages=7,
+            num_warps=8,
+            num_stages=4,
         )
 
         if M != M_pad or N != N_pad:
