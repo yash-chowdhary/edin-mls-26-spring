@@ -16,9 +16,11 @@ if _dir not in sys.path:
 
 from . import layers
 
-layers.Linear.BACKEND = "cublas"
-layers.MLP.FUSED = False
-layers.EncoderMLP.FUSED = False
+# Only override BACKEND if not already set via environment variable
+if not layers.LINEAR_BACKEND:
+    layers.Linear.BACKEND = "cublas"
+layers.MLP.FUSED = True
+layers.EncoderMLP.FUSED = True
 
 from . import model
 from . import rope
