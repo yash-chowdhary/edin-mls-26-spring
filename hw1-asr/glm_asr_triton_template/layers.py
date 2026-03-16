@@ -285,6 +285,34 @@ def next_power_of_two(x: int) -> int:
     return 1 << (x - 1).bit_length() if x > 0 else 1
 
 
+def _to_torch_tensor(arr, dtype=torch.float32, device='cuda'):
+    """Convert array-like object (CuPy, NumPy, etc.) to PyTorch tensor.
+
+    Handles:
+    - PyTorch tensors (returned as-is, optionally moved to device)
+    - NumPy arrays (converted directly)
+    - CuPy arrays (transferred to CPU as NumPy first)
+    - Other array-like objects (converted via np.asarray)
+    """
+    if isinstance(arr, torch.Tensor):
+        if arr.dtype != dtype or arr.device.type != device.split(':')[0]:
+            return arr.to(dtype=dtype, device=device)
+        return arr
+
+    if arr is None:
+        return None
+
+    # Convert to NumPy first (handles CuPy and other types)
+    if hasattr(arr, 'get'):  # CuPy array detection
+        arr = np.asarray(arr.get())
+    elif not isinstance(arr, np.ndarray):
+        arr = np.asarray(arr)
+
+    # Convert NumPy to torch
+    tensor = torch.from_numpy(arr)
+    return tensor.to(dtype=dtype, device=device)
+
+
 # ============================================================================
 # Triton Kernels
 # ============================================================================
@@ -1375,9 +1403,18 @@ def _generate_v8b(
     audio_pad_token_id=59260,
 ):
     """KV-cached O(n) generation using model.decode() with use_cache=True."""
-    # Ensure input_features is a tensor (some benchmarks pass numpy arrays)
-    if not isinstance(input_features, torch.Tensor):
-        input_features = torch.from_numpy(input_features).to(dtype=torch.float32, device='cuda')
+    # Convert all inputs to PyTorch tensors (benchmarks may pass numpy/cupy arrays)
+    input_features = _to_torch_tensor(input_features, dtype=torch.float32, device='cuda')
+
+    if input_features_mask is not None:
+        input_features_mask = _to_torch_tensor(input_features_mask, dtype=torch.float32, device='cuda')
+
+    if input_ids is not None:
+        input_ids = _to_torch_tensor(input_ids, dtype=torch.int64, device='cuda')
+
+    if attention_mask is not None:
+        attention_mask = _to_torch_tensor(attention_mask, dtype=torch.float32, device='cuda')
+
     # Encode audio
     audio_embeds = self.encode_audio(input_features, input_features_mask)
 
@@ -1454,7 +1491,14 @@ def _generate_v8b(
             inputs_embeds=new_embeds, past_key_values=past_kv, use_cache=True
         )
 
-    return generated
+    # Convert PyTorch tensor to CuPy array for compatibility with benchmark script
+    try:
+        import cupy as cp
+        generated_np = generated.detach().cpu().numpy()
+        return cp.asarray(generated_np)
+    except ImportError:
+        # Fallback if CuPy is not available - return torch tensor
+        return generated
 
 
 _v8b_patched = False
