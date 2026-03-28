@@ -8,7 +8,6 @@
 #SBATCH --output=ncu_slurm_%j.log
 #SBATCH --error=ncu_slurm_%j.err
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=ankushburman.ab@gmail.com
 
 set -e
 

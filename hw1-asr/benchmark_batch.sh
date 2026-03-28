@@ -13,7 +13,6 @@
 #SBATCH --output=benchmark_%j.log
 #SBATCH --error=benchmark_%j.err
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=meave.sullivan@live.co.uk
 
 set -e
 
