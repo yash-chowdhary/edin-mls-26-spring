@@ -60,35 +60,28 @@
 
 ---
 
-## 3. Flash attention — encoder (*N* = 750, *d* = 64, one head, one layer)
+## 3. Flash attention — Encoder (seq_q = seq_k = **1500**, head_dim = 64)
+
+Per head, per layer:
 
 **FLOPs**
 
-1. *QK*^T: (750×64)·(64×750) → **2 × 750 × 750 × 64 = 72×10^6**
-2. *PV*: (750×750)·(750×64) → **72×10^6**
-3. Softmax (per score): ~5 ops × 750 × 750 → **2.8125×10^6**
+- Q @ K^T: 2 × 1500 × 1500 × 64 = **288,000,000**  
+- P @ V: 2 × 1500 × 1500 × 64 = **288,000,000**  
+- Softmax ~5 ops per score: 5 × 1500 × 1500 = **11,250,000**  
+- **Total ≈ 587,250,000 FLOPs per head** (~4× the N = 750 case, since leading term is **N²**)
 
-**Total per head** ≈ 147×10^6 FLOPs  
+**DRAM bytes (tiled flash, BLOCK_M = 128)**
 
-**DRAM bytes (tiled flash, fp16 tiles 64×64)**
+- num_Q_tiles = ceil(1500 / 128) = **12**  
+- Q + O footprint: 1500 × 64 × 2 × 2 = **384,000** bytes  
+- K streamed once per Q-tile: 12 × (1500 × 64 × 2) = **2,304,000** bytes  
+- V streamed once per Q-tile: **2,304,000** bytes  
+- **Total ≈ 4,992,000 bytes ≈ 4.99 MB per head**
 
-- 12 Q-tiles × 12 K/V-tiles; per Q-tile: Q tile + 12×(K tile + V tile) + O tile, each **64 × 64 × 2 = 8192** B
+**AI (flash) = 587,250,000 / 4,992,000 ≈ 118 FLOP/byte**
 
-**Worst case (all tile loads hit DRAM)**
-
-- Q: 12 × 8192 = 98,304  
-- K, V: 12 × 12 × 8192 each → 1,179,648  
-- O: 98,304  
-- **Total** ≈ 2.556×10^6 B → AI ≈ 147M / 2.56M ≈ **57** FLOP/byte
-
-**Best case (Q, K, V, O each read/written once)**
-
-- 4 × (750 × 64 × 2) = 384,000 B → AI ≈ **374** FLOP/byte
-
-**Intermediate (K/V tiles ~6× effective HBM traffic)**
-
-- Bytes ≈ 96K + 6×96K + 6×96K + 96K = 1,344K B  
-- AI ≈ 147M / 1,376,256 ≈ **107 → ~112** FLOP/byte (**reported value**)
+**Classification:** Still **compute-bound** on H200 (ridge ~12.7) and on RTX 5090 (ridge ~58.5).
 
 ---
 
@@ -193,7 +186,7 @@
 
 ---
 
-## Summary 
+## Summary
 
 
 | Operation                   | Reported AI (FLOP/B) | Notes                        |

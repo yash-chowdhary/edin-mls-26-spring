@@ -6,14 +6,12 @@ Every optimization that contributed to the final speedup, in chronological order
 
 ## Step 0: Baseline (261.3ms)
 
-**Commit:** origin/main template
 **What:** The unmodified template with placeholder `pass` statements in all kernel functions. Uses the example implementation's attention (3-kernel pipeline), fp32 throughout, stock O(n²) `generate()` function.
 
 ---
 
 ## Step 1: Implement All 10 Triton Kernels (261.3ms → ~260ms)
 
-**Commit:** `12daf13`
 **What:** Filled in all `pass` stubs with working Triton kernel implementations:
 
 - `rmsnorm_kernel`: RMS normalization — compute `x / sqrt(mean(x²) + eps) * weight`. Uses `tl.sum` for the mean, `tl.rsqrt` for the inverse square root. Grid: one program per row.
@@ -35,7 +33,6 @@ Every optimization that contributed to the final speedup, in chronological order
 
 ## Step 2: Fix cuBLAS and Switch Backend (260ms → 214ms, -47ms)
 
-**Commit:** `82591ff` then `bdc7690`
 **What:** Two related fixes:
 
 1. The RTX 5090 had a cuBLAS version mismatch (pip-installed nvidia-cublas-cu12 13.1 conflicted with system CUDA 13.0). Fixed by uninstalling the pip package: `pip uninstall nvidia-cublas-cu12`.
@@ -51,7 +48,6 @@ Every optimization that contributed to the final speedup, in chronological order
 
 ## Step 3: bf16 Weights + Fused Flash Attention (214ms → 136.4ms, -73.4ms bundled)
 
-**Commit:** `9453c39` then `f0b4868`
 **What:** Two optimizations applied together:
 
 ### 3a: bf16 Weights
@@ -100,10 +96,9 @@ Also added:
 
 ## Step 4: Fused Q+K RoPE Pair Kernel (136.4ms → 124.6ms, -11.8ms)
 
-**Commit:** `e277e9f`
 **What:** Adopted from person 3's branch. RoPE requires applying the same cos/sin rotation to both Q and K tensors. The baseline uses two separate kernel launches — one for Q, one for K.
 
-The fused kernel `fused_rope_pair_kernel` (rope.py:189) processes both in a single launch. Grid: `((total_qh + total_kh) * seq_len,)`. Programs with `pid < total_qh * seq_len` handle Q; the rest handle K.
+The fused kernel `fused_rope_pair_kernel` (rope.py) processes both in a single launch. Grid: `((total_qh + total_kh) * seq_len,)`. Programs with `pid < total_qh * seq_len` handle Q; the rest handle K.
 
 **Why it helps:** Each kernel launch has ~5-15μs of overhead (CPU→GPU dispatch, argument setup). With 32 encoder layers + 28 decoder layers = 60 layers, fusing saves 60 kernel launches per inference = ~0.3-0.9ms from launch overhead alone. The remaining ~11ms savings come from better memory access patterns — loading cos/sin tables once and applying to both Q and K in the same cache-warm state.
 
@@ -115,7 +110,6 @@ The fused kernel `fused_rope_pair_kernel` (rope.py:189) processes both in a sing
 
 ## Step 5: bf16 RMSNorm Output (124.6ms → 120.7ms, -3.9ms)
 
-**Commit:** `e277e9f`
 **What:** Also adopted from person 3's branch. Added `rmsnorm_bf16_kernel` that computes RMSNorm in fp32 but stores the output as bf16:
 
 ```python
@@ -131,7 +125,6 @@ Without this, the norm kernel outputs fp32, then the next Linear layer casts to 
 
 ## Step 6: bf16 LayerNorm Output (120.7ms → 121.1ms, -0.7ms)
 
-**Commit:** `fe9f33b`
 **What:** Same approach as Step 5, applied to `layernorm_kernel` for the encoder. Conditional on `Linear.BF16`:
 
 ```python
@@ -145,7 +138,6 @@ if Linear.BF16:
 
 ## Step 7: KV-Cached Generation (121.1ms → 113.5ms, -7.6ms)
 
-**Commit:** `fe9f33b`
 **What:** The stock `generate()` in model.py (read-only) reprocesses the entire growing sequence on every decode step:
 
 - Step 1: process [prompt + audio_embeddings] → predict token A
@@ -154,7 +146,7 @@ if Linear.BF16:
 
 This is O(n²) in the number of generated tokens.
 
-`_generate_v8b()` (layers.py:1381) uses KV caching:
+`_generate_v8b()` (layers.py) uses KV caching:
 
 - Prefill: process all tokens once, store K/V projections for every layer
 - Step 2: process only token A, append its K/V to cache, attend to full cache
@@ -162,7 +154,7 @@ This is O(n²) in the number of generated tokens.
 
 This is O(n).
 
-**Monkey-patching:** Since model.py is read-only, we can't modify `generate()`. Instead, `_try_patch_v8b()` (layers.py:1482) patches `generate_v8b` as a class method on `GlmAsrModel` during model construction. It's called inside `Linear.__init__()` with a `_v8b_patched` flag to ensure it runs exactly once. The benchmark script auto-detects it via `hasattr(model, 'generate_v8b')`.
+**Monkey-patching:** Since model.py is read-only, we can't modify `generate()`. Instead, `_try_patch_v8b()` (layers.py) patches `generate_v8b` as a class method on `GlmAsrModel` during model construction. It's called inside `Linear.__init__()` with a `_v8b_patched` flag to ensure it runs exactly once. The benchmark script auto-detects it via `hasattr(model, 'generate_v8b')`.
 
 **Implementation uses model.py's existing KV cache infrastructure:** `self.decode(inputs_embeds=..., use_cache=True)` returns `(logits, past_key_values)`. The past_key_values tuple is passed back on the next step.
 
@@ -172,7 +164,6 @@ This is O(n).
 
 ## Step 8: SDPA Fallback for KV-Cached Decode (113.5ms → 110.0ms, -3.5ms)
 
-**Commit:** `0410b3b`
 **What:** During KV-cached decode, seq_q=1 (processing a single new token). Launching our custom flash attention kernel for a single-row query has disproportionate overhead — the kernel launch + grid setup costs more than the actual computation.
 
 PyTorch's `F.scaled_dot_product_attention` is optimized for this exact case on modern GPUs (uses cuDNN attention backend on Hopper).
@@ -195,7 +186,6 @@ if q.is_cuda and seq_q <= 4:
 
 ## Step 9: fp16 cuBLAS HGEMM (110.0ms → 109.6ms, -0.4ms)
 
-**Commit:** part of `5c25921`
 **What:** Changed `Linear._HALF_DTYPE` from `torch.bfloat16` to `torch.float16`. cuBLAS HGEMM with fp16 is 0.4ms faster than bf16 on the RTX 5090's tensor cores.
 
 **Impact:** -0.4ms.
@@ -204,7 +194,6 @@ if q.is_cuda and seq_q <= 4:
 
 ## Step 10: Remove `.float()` Casts (109.6ms → 102.1ms, -7.5ms)
 
-**Commit:** `5c25921`
 **What:** The original codebase called `.float()` (convert to fp32) after every `F.linear()` call — approximately 120 call sites across 32 encoder layers and 28 decoder layers. Each `.float()` call doubles the data size (2 bytes → 4 bytes) and writes the result to VRAM, only for the next operation to cast back.
 
 This is redundant because Triton kernels already compute in fp32 internally:
@@ -226,7 +215,6 @@ The Python-side `.float()` just adds a VRAM round-trip between every pair of ope
 
 ## Step 11: Remove Activation fp32 Casts (102.1ms → 98.4ms, -3.7ms)
 
-**Commit:** `5c25921`
 **What:** The GELU and SiLU activation wrappers had Python-side fp32 casts:
 
 ```python
@@ -243,7 +231,6 @@ Removed these casts. The kernels receive fp16, load as fp32 internally, compute,
 
 ## Step 12: Remove Norm fp32 Casts + fp16 Embeddings (98.4ms → 98.5ms, ~0ms)
 
-**Commit:** `5c25921`
 **What:** Same approach for RMSNorm/LayerNorm wrappers — removed Python-side `.float()` calls. Also made the embedding kernel output fp16 directly:
 
 ```python
@@ -257,8 +244,7 @@ output = torch.empty((...), dtype=out_dtype, ...)
 
 ## Step 13: GPUProfile + Dynamic Tiles (98.5ms → 98.5ms, maintenance)
 
-**Commit:** `e496204`
-**What:** No performance change on RTX 5090, but essential for portability. Created `GPUProfile` class (layers.py:89) that:
+**What:** No performance change on RTX 5090, but essential for portability. Created `GPUProfile` class (layers.py) that:
 
 1. Detects GPU architecture via `torch.cuda.get_device_capability()` and shared memory optin size
 2. Classifies into named architectures: `blackwell_consumer`, `hopper`, `ada`, `ampere_dc`, etc.
@@ -267,16 +253,6 @@ output = torch.empty((...), dtype=out_dtype, ...)
 
 **Why needed:** The H200 teaching cluster has ~228KB shared memory (can use 128×128 tiles with num_stages=2). The RTX 5090 has ~99KB (limited to 64×64 with num_stages=1). Without GPUProfile, switching between GPUs requires manual tile changes.
 
----
-
-## Step 14: Remove Warmup Autotune (98.5ms → 98.5ms, code cleanup)
-
-**Commit:** `8611863`
-**What:** Removed ~110 lines of autotune code that was built and found to be counterproductive. The `warmup_attention_tiles()` function benchmarked all valid tile configs at runtime. It selected BLOCK_M=16 as optimal in micro-benchmarks, but the full-pipeline benchmark showed 101.6ms vs 98.5ms for hand-tuned 64×64 — a 3.1ms regression.
-
-**Root cause:** Micro-benchmarks run each config in isolation with synthetic data. Real-world performance depends on inter-kernel cache effects, memory fragmentation, and pipeline interactions that synthetic benchmarks don't capture.
-
----
 
 ## Rejected Optimizations (tested, measured, not adopted)
 
