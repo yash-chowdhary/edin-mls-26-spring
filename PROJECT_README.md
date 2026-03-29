@@ -61,6 +61,31 @@ source utils/setup-triton.sh
 
 That script installs the Python stack. It is the installation entry point.
 
+## Optional CUDA 13 Repair Script
+
+The repo also contains `fix-cuda.sh`, but it serves a different purpose from
+`hw1-asr/setup_saxa_env.sh`.
+
+- `fix-cuda.sh` is an optional Python-stack repair script
+- it activates `conda activate mls` via `/opt/conda/bin/conda`
+- it uninstalls the cu12 PyTorch/NVIDIA pip packages
+- it installs `torch==2.10.0+cu130`
+- it installs `triton==3.6.0` plus the remaining Python dependencies
+
+So:
+
+- it does install the CUDA 13 PyTorch wheel stack inside the environment
+- it does not install the system NVIDIA driver/toolkit
+- it is not used automatically by `hw1-asr/setup_saxa_env.sh`
+
+Important Saxa nuance:
+
+- `fix-cuda.sh` is currently hardcoded to `/opt/conda/bin/conda`
+- the Saxa benchmark environment we used resolves Python from
+  `/home/s2884198/.conda/envs/mls/bin`
+- so `fix-cuda.sh` should be treated as an optional repair tool, not as the
+  canonical Saxa bootstrap script
+
 ## Saxa / H200 Runtime Environment
 
 For cluster reproduction on `saxa`, source the small runtime helper from the

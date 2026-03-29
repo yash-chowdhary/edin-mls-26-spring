@@ -54,6 +54,7 @@ For project-level setup and reproduction instructions, start with
 | `../PROJECT_README.md` | Project-level reproduction guide for the cleaned-up report branch |
 | `../hw1-asr/setup_saxa_env.sh` | Small Saxa/H200 runtime environment helper used by the canonical H200 job wrappers |
 | `../hw1-asr/run_report_benchmarks.sh` | Thin wrapper that runs or submits the exact report benchmark entry points |
+| `../fix-cuda.sh` | Optional Python-stack repair script for switching the env from cu12 PyTorch packages to the cu130 stack; not part of the canonical Saxa runtime helper path |
 
 ## Removed or Superseded Sources
 
