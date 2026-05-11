@@ -10,15 +10,24 @@ Key Characteristics:
 import os
 import sys
 
+import torch
+
 _dir = os.path.dirname(os.path.abspath(__file__))
 if _dir not in sys.path:
     sys.path.insert(0, _dir)
 
 from . import layers
 
-layers.Linear.BACKEND = "cublas"
-layers.MLP.FUSED = False
-layers.EncoderMLP.FUSED = False
+torch.set_float32_matmul_precision("high")
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
+layers.Linear.BACKEND = "torch"
+layers.Linear.BF16 = True
+layers.MLP.FUSED = True
+layers.EncoderMLP.FUSED = True
 
 from . import model
 from . import rope

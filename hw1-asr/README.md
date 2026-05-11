@@ -1,5 +1,10 @@
 # GLM-ASR Student Assignment
 
+> Final project note:
+> On the submission branch, use `../PROJECT_README.md` for the
+> project-level reproduction path and `../benchmarks/benchmarks_README.md` for
+> benchmark provenance. This README remains the assignment-level guide.
+
 This assignment helps you understand GPU kernel optimization by implementing a speech recognition model using Triton and NVIDIA cuTile.
 
 ## Overview
@@ -240,9 +245,10 @@ Shell scripts provide user-friendly wrappers with folder validation and help mes
 ./benchmark_detailed.sh glm_asr_triton_example
 ./benchmark_detailed.sh glm_asr_cutile_example
 
-# Profile specific operators
-./benchmark_detailed.sh --attention-only
-./benchmark_detailed.sh --linear-only
+# Optional profiling knobs
+./benchmark_detailed.sh glm_asr_triton_template --runs 5
+./benchmark_detailed.sh glm_asr_triton_template --seq-len 512
+./benchmark_detailed.sh glm_asr_triton_template --audio /path/to/test_audio.wav
 
 # Generate Nsight Systems profile
 ./benchmark_detailed.sh glm_asr_triton_template --nsys
